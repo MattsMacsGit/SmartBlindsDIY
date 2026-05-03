@@ -1,0 +1,9 @@
+substitutions:
+  name: blindliving01
+  friendly_name: Living Room Blind 1
+  dir_inverted: true
+  api_encryption_key: !secret api_encryption_key01   # pulls your key01
+  ota_password: !secret ota_password                 # uses the one in secrets.yaml
+
+packages:
+  common: !include blind_common.yaml

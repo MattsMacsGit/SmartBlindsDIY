@@ -1,0 +1,535 @@
+# =============================================
+# BLIND COMMON TEMPLATE - Dual Travel (Clean Dashboard + Closed Fix)
+# Safety: position_known dirty-bit prevents moves after power loss mid-travel
+# Fix v2: Force flash sync immediately after marking position safe to close
+#         the 60-second window where a reboot could lose the safe flag.
+# Fix v4 (see below)
+# Fix v5: Overdrive hardcoded value replaced with overdrive_percent global.
+#         Exposed as a Number entity in HA so it can be tuned live without reflashing.
+# Fix v4: All three move actions now check if already at target BEFORE writing
+#         position_known = false. This means a HA reconnect re-sending the last
+#         command to a blind that is already parked at that position is completely
+#         harmless - it logs "ignored" and returns without touching safety state.
+# =============================================
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+  on_boot:
+    priority: -200.0
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(calibrated) && id(travel_up_steps) > 0;
+          then:
+            - lambda: |-
+                int32_t restored_steps = (int32_t)(id(current_percent) * (float)id(travel_up_steps));
+                id(blind_stepper).report_position(restored_steps);
+                id(blind_stepper).set_target(restored_steps);
+                ESP_LOGI("boot", "Restored stepper position to %d steps (%.1f%%)",
+                         restored_steps, id(current_percent) * 100.0);
+
+      - output.turn_on: ms1_output
+      - output.turn_on: ms2_output
+      - output.turn_off: ms3_output
+      - logger.log:
+          level: INFO
+          format: "Microstepping set to 8x on TMC2209"
+
+esp8266:
+  board: nodemcuv2
+  restore_from_flash: true
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: ${api_encryption_key}
+
+ota:
+  platform: esphome
+  password: ${ota_password}
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+
+captive_portal:
+
+preferences:
+  flash_write_interval: 5s
+
+output:
+  - platform: gpio
+    id: ms1_output
+    pin: D3
+  - platform: gpio
+    id: ms2_output
+    pin: D4
+  - platform: gpio
+    id: ms3_output
+    pin: D5
+
+globals:
+  - id: calibrated
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: travel_down_steps
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: travel_up_steps
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: current_percent
+    type: float
+    restore_value: yes
+    initial_value: '1.0'
+
+  # Safety dirty-bit: false = position unknown (e.g. power lost mid-move).
+  # Written false BEFORE a move starts, written true when stepper comes to rest.
+  # Persisted to flash so a reboot after power loss retains the unsafe state.
+  # FIX: global_preferences->sync() is called immediately after writing true so
+  # the safe state is committed to flash right away, not deferred up to 1 minute.
+  - id: position_known
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: open_steps
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: closed_steps
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: marked_open
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: marked_closed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: started
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: was_moving
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Overdrive applied to all upward moves to compensate for gravity settling
+  # when the motor stops (~10-12mm drop on 1557mm travel = ~0.65%).
+  # Stored as a straight percentage value e.g. 0.60 = 0.60%.
+  # Adjustable from the HA dashboard without reflashing via the Number entity.
+  - id: overdrive_percent
+    type: float
+    restore_value: yes
+    initial_value: '0.40'
+
+stepper:
+  - platform: a4988
+    id: blind_stepper
+    step_pin: D1
+    dir_pin:
+      number: D2
+      inverted: ${dir_inverted}
+    sleep_pin:
+      number: D6
+      inverted: true
+    max_speed: 2800 steps/s
+    acceleration: 40.0
+    deceleration: 70.0
+
+button:
+  # --- Jog buttons: always permitted regardless of position_known ---
+  - platform: template
+    name: "Jog Up"
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            ESP_LOGI("jog", "Jogging UP (safety bypass - jog always permitted)");
+        - stepper.set_target:
+            id: blind_stepper
+            target: !lambda 'return id(blind_stepper).current_position + 1000000;'
+
+  - platform: template
+    name: "Jog Down"
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            ESP_LOGI("jog", "Jogging DOWN (safety bypass - jog always permitted)");
+        - stepper.set_target:
+            id: blind_stepper
+            target: !lambda 'return id(blind_stepper).current_position - 1000000;'
+
+  - platform: template
+    name: "Stop"
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            ESP_LOGI("jog", "STOP");
+        - stepper.set_target:
+            id: blind_stepper
+            target: !lambda 'return id(blind_stepper).current_position;'
+
+  - platform: template
+    name: "Nudge Up & Re-Top"
+    id: nudge_up_and_retop
+    entity_category: config
+    on_press:
+      then:
+        - lambda: |-
+            const int32_t nudge_steps = 1200;
+            ESP_LOGI("nudge", "Nudging up by %d steps then re-topping", nudge_steps);
+            int32_t current = id(blind_stepper).current_position;
+            id(blind_stepper).set_target(current + nudge_steps);
+        - delay: 12s
+        - switch.turn_on: quick_re_top_switch
+
+switch:
+  - platform: template
+    id: mark_top_switch
+    name: "Mark as Fully Open (Top)"
+    entity_category: config
+    turn_on_action:
+      then:
+        - lambda: |-
+            id(open_steps) = id(blind_stepper).current_position;
+            id(marked_open) = true;
+            ESP_LOGI("calib", "Open (top) marked at %d steps", id(open_steps));
+        - delay: 800ms
+        - switch.turn_off: mark_top_switch
+
+  - platform: template
+    id: quick_re_top_switch
+    name: "Quick Re-Top (Re-Mark Fully Open)"
+    entity_category: config
+    turn_on_action:
+      then:
+        - lambda: |-
+            if (!id(calibrated)) {
+              ESP_LOGW("calib", "Cannot quick re-top - not calibrated!");
+              return;
+            }
+            id(current_percent) = 1.0;
+            int32_t top_pos = id(travel_up_steps);
+            id(blind_stepper).report_position(top_pos);
+            id(blind_stepper).set_target(top_pos);
+
+            // Re-establish known position - safe to move again
+            id(position_known) = true;
+            // FIX: Force immediate flash write so safe state survives a reboot
+            global_preferences->sync();
+
+            id(roller_blind).position = 1.0;
+            id(roller_blind).publish_state();
+            ESP_LOGI("calib", "Quick Re-Top applied - position set to 100%% open (no movement)");
+            ESP_LOGI("safety", "Position marked SAFE via Quick Re-Top - normal operation restored");
+        - delay: 800ms
+        - switch.turn_off: quick_re_top_switch
+
+  - platform: template
+    id: mark_bottom_switch
+    name: "Mark as Fully Closed (Bottom)"
+    entity_category: config
+    turn_on_action:
+      then:
+        - lambda: |-
+            id(closed_steps) = id(blind_stepper).current_position;
+            id(marked_closed) = true;
+            ESP_LOGI("calib", "Closed (bottom) marked at %d steps", id(closed_steps));
+        - delay: 800ms
+        - switch.turn_off: mark_bottom_switch
+
+  - platform: template
+    id: save_calib_switch
+    name: "Save Calibration"
+    entity_category: config
+    turn_on_action:
+      then:
+        - lambda: |-
+            if (!id(marked_open) || !id(marked_closed)) {
+              ESP_LOGW("calib", "Cannot save - mark both ends first!");
+              return;
+            }
+
+            int32_t top1   = id(open_steps);
+            int32_t bottom = id(closed_steps);
+            int32_t top2   = id(blind_stepper).current_position;
+
+            id(travel_down_steps) = std::abs(top1 - bottom);
+            id(travel_up_steps)   = std::abs(top2 - bottom);
+
+            ESP_LOGI("calib", "=== CALIBRATION SAVED ===");
+            ESP_LOGI("calib", "Travel DOWN: %d steps", id(travel_down_steps));
+            ESP_LOGI("calib", "Travel UP:   %d steps", id(travel_up_steps));
+
+            id(calibrated) = true;
+            id(current_percent) = 1.0;
+
+            int32_t top_pos = id(travel_up_steps);
+            id(blind_stepper).report_position(top_pos);
+            id(blind_stepper).set_target(top_pos);
+
+            // Calibration establishes a known position - safe to move
+            id(position_known) = true;
+            // FIX: Force immediate flash write so safe state survives a reboot
+            global_preferences->sync();
+
+            id(roller_blind).position = 1.0;
+            id(roller_blind).publish_state();
+
+            ESP_LOGI("calib", "Blind set to 100%% open");
+            ESP_LOGI("safety", "Position marked SAFE via calibration - normal operation restored");
+        - delay: 800ms
+        - switch.turn_off: save_calib_switch
+
+  - platform: template
+    id: reset_calib_switch
+    name: "Reset Calibration"
+    entity_category: config
+    turn_on_action:
+      then:
+        - lambda: |-
+            id(calibrated) = false;
+            id(travel_down_steps) = 0;
+            id(travel_up_steps) = 0;
+            id(current_percent) = 1.0;
+            id(marked_open) = false;
+            id(marked_closed) = false;
+            // Position is no longer known after a calibration reset
+            id(position_known) = false;
+            ESP_LOGI("calib", "Calibration reset!");
+            ESP_LOGW("safety", "Position marked UNSAFE after calibration reset - recalibrate to restore normal operation");
+        - delay: 800ms
+        - switch.turn_off: reset_calib_switch
+
+number:
+  - platform: template
+    id: overdrive_number
+    name: "Upward Overdrive %"
+    entity_category: config
+    min_value: 0.0
+    max_value: 2.0
+    step: 0.05
+    unit_of_measurement: "%"
+    lambda: |-
+      return id(overdrive_percent);
+    set_action:
+      - lambda: |-
+          id(overdrive_percent) = x;
+          ESP_LOGI("calib", "Overdrive set to %.2f%%", x);
+
+cover:
+  - platform: template
+    id: roller_blind
+    name: "Roller Blind"
+    device_class: blind
+    has_position: true
+    optimistic: false
+
+    # Returns {} (unknown) when not calibrated OR when position is not known
+    # (e.g. power was lost during a move). HA will show the cover as unknown.
+    lambda: |-
+      if (!id(calibrated) || id(travel_up_steps) == 0) return {};
+      if (!id(position_known)) return {};
+      return id(current_percent);
+
+    open_action:
+      - lambda: |-
+          bool currently_moving = (id(blind_stepper).current_position != id(blind_stepper).target_position);
+          if (!id(position_known) && !currently_moving) {
+            ESP_LOGW("safety", "OPEN blocked - position unknown after power loss!");
+            ESP_LOGW("safety", "Jog to fully open position then use Quick Re-Top, or recalibrate.");
+            return;
+          }
+          // Already fully open - ignore command without touching position_known.
+          // This prevents a HA reconnect re-send from incorrectly marking unsafe.
+          if (!currently_moving && id(current_percent) >= 0.99f) {
+            ESP_LOGI("cover", "OPEN ignored - already fully open");
+            return;
+          }
+          if (currently_moving) {
+            ESP_LOGI("cover", "OPEN redirect during active move - retargeting");
+          } else {
+            id(position_known) = false;
+            ESP_LOGI("cover", "OPEN command received - position marked unsafe until arrival");
+          }
+          // Overdrive on upward moves to compensate for gravity settling
+          // when the motor stops - blind drops ~10-12mm on 1557mm travel.
+          // Factor derived from overdrive_percent global (adjustable in HA dashboard).
+          float open_factor = 1.0f + (id(overdrive_percent) / 100.0f);
+          int32_t open_target = (int32_t)(id(travel_up_steps) * open_factor);
+          id(blind_stepper).set_target(open_target);
+
+    close_action:
+      - lambda: |-
+          bool currently_moving = (id(blind_stepper).current_position != id(blind_stepper).target_position);
+          if (!id(position_known) && !currently_moving) {
+            ESP_LOGW("safety", "CLOSE blocked - position unknown after power loss!");
+            ESP_LOGW("safety", "Jog to fully open position then use Quick Re-Top, or recalibrate.");
+            return;
+          }
+          // Already fully closed - ignore command without touching position_known.
+          // This prevents a HA reconnect re-send from incorrectly marking unsafe.
+          if (!currently_moving && id(current_percent) <= 0.01f) {
+            ESP_LOGI("cover", "CLOSE ignored - already fully closed");
+            return;
+          }
+          if (currently_moving) {
+            ESP_LOGI("cover", "CLOSE redirect during active move - retargeting");
+          } else {
+            id(position_known) = false;
+            ESP_LOGI("cover", "CLOSE command received - position marked unsafe until arrival");
+          }
+          id(blind_stepper).set_target(0);
+
+    position_action:
+      - lambda: |-
+          bool currently_moving = (id(blind_stepper).current_position != id(blind_stepper).target_position);
+          if (!id(position_known) && !currently_moving) {
+            ESP_LOGW("safety", "POSITION blocked - position unknown after power loss!");
+            ESP_LOGW("safety", "Jog to fully open position then use Quick Re-Top, or recalibrate.");
+            return;
+          }
+          if (!id(calibrated) || id(travel_up_steps) == 0) {
+            ESP_LOGW("cover", "Cannot move - not calibrated!");
+            return;
+          }
+
+          float current_pos = id(current_percent);
+          float target_pos  = pos;
+          float diff = std::abs(target_pos - current_pos);
+
+          // Already at target - ignore command without touching position_known.
+          // This prevents a HA reconnect re-send from incorrectly marking unsafe.
+          if (!currently_moving && diff < 0.01f) {
+            ESP_LOGI("cover", "POSITION ignored - already at %.1f%%", target_pos * 100);
+            return;
+          }
+
+          if (currently_moving) {
+            // Redirect during an active move - stepper is live so position is tracked, just retarget
+            ESP_LOGI("cover", "POSITION redirect during active move - retargeting");
+          } else {
+            // Fresh move from rest - mark unsafe before stepper starts
+            id(position_known) = false;
+            ESP_LOGI("cover", "POSITION command received - position marked unsafe until arrival");
+          }
+
+          int32_t target_steps = 0;
+
+          if (target_pos > current_pos) {
+            // Overdrive on upward moves to compensate for gravity settling
+            // when the motor stops - blind drops ~10-12mm on 1557mm travel.
+            // Factor derived from overdrive_percent global (adjustable in HA dashboard).
+            float up_factor = 1.0f + (id(overdrive_percent) / 100.0f);
+            target_steps = (int32_t)(target_pos * id(travel_up_steps) * up_factor);
+            ESP_LOGI("cover", "POSITION UP to %.1f%% (using travel_up_steps + %.2f%% overdrive)", target_pos * 100, id(overdrive_percent));
+          } else {
+            target_steps = (int32_t)(target_pos * id(travel_down_steps));
+            ESP_LOGI("cover", "POSITION DOWN to %.1f%% (using travel_down_steps)", target_pos * 100);
+          }
+
+          id(blind_stepper).set_target(target_steps);
+
+    stop_action:
+      - lambda: |-
+          ESP_LOGI("cover", "STOP command received");
+      - stepper.set_target:
+          id: blind_stepper
+          target: !lambda 'return id(blind_stepper).current_position;'
+
+interval:
+  # Fires once 5 seconds after boot - by this point WiFi and the ESPHome API
+  # handshake are complete so HA will actually receive the cover publish.
+  # This is where we log boot state and push the correct cover state (including
+  # unknown if position_known is false) so HA reflects reality immediately.
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (id(started)) return;
+          id(started) = true;
+
+          ESP_LOGI("boot", "=== DEVICE BOOTED ===");
+          ESP_LOGI("boot", "Calibrated    = %s", id(calibrated) ? "YES" : "NO");
+          ESP_LOGI("boot", "Position safe = %s", id(position_known) ? "YES" : "NO");
+          if (id(calibrated)) {
+            ESP_LOGI("boot", "Travel DOWN = %d | UP = %d",
+                     id(travel_down_steps), id(travel_up_steps));
+            ESP_LOGI("boot", "Restored percent = %.1f%%", id(current_percent) * 100.0);
+          }
+          if (!id(position_known)) {
+            ESP_LOGW("safety", "=== ACTION REQUIRED ===");
+            ESP_LOGW("safety", "Position unknown - moves are blocked.");
+            ESP_LOGW("safety", "Jog to fully open position then use Quick Re-Top, or recalibrate.");
+          } else {
+            ESP_LOGI("safety", "Position is SAFE - normal operation permitted");
+          }
+
+          // Publish cover state now that API is connected.
+          // If position_known is false the cover lambda returns {} so HA will
+          // show the blind as unknown rather than its last cached position.
+          id(roller_blind).publish_state();
+          ESP_LOGI("boot", "Cover state published to HA");
+
+  - interval: 200ms
+    then:
+      - lambda: |-
+          if (!id(calibrated) || id(travel_up_steps) == 0) return;
+
+          int32_t cur = id(blind_stepper).current_position;
+          int32_t tgt = id(blind_stepper).target_position;
+          bool moving = (cur != tgt);
+
+          float new_pos = (float)cur / (float)id(travel_up_steps);
+          if (new_pos < 0.0f) new_pos = 0.0f;
+          if (new_pos > 1.0f) new_pos = 1.0f;
+
+          // Snap to exact extremes so HA always shows "Open" or "Closed"
+          // rather than 99.9% or 0.1% due to floating point or step rounding.
+          if (new_pos <= 0.01f) new_pos = 0.0f;
+          if (new_pos >= 0.99f) new_pos = 1.0f;
+
+          if (moving) {
+            if (std::abs(new_pos - id(current_percent)) > 0.005f) {
+              id(current_percent) = new_pos;
+              id(roller_blind).position = new_pos;
+              id(roller_blind).publish_state();
+            }
+            id(was_moving) = true;
+          } else {
+            if (id(was_moving)) {
+              id(was_moving) = false;
+              if (std::abs(new_pos - id(current_percent)) > 0.005f) {
+                id(current_percent) = new_pos;
+              }
+              id(roller_blind).position = id(current_percent);
+              id(roller_blind).publish_state();
+              ESP_LOGI("cover", "Position saved to persistent memory: %.1f%%",
+                       id(current_percent) * 100.0);
+
+              // Stepper has come to rest at its target - position is now known and safe.
+              // FIX: Force immediate flash write so the safe flag and final position
+              // are committed to flash right now, not deferred up to 1 minute.
+              // This closes the window where a reboot shortly after arrival would
+              // cause the blind to boot up unsafe despite having completed its move.
+              id(position_known) = true;
+              global_preferences->sync();
+              ESP_LOGI("safety", "Move complete - position marked SAFE at %.1f%% (flash synced)",
+                       id(current_percent) * 100.0);
+            }
+          }
